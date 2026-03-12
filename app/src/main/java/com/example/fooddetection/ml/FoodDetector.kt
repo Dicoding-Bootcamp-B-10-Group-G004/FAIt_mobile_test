@@ -7,6 +7,7 @@ import android.util.Log
 import androidx.camera.core.ImageProxy
 import com.example.fooddetection.data.Detection
 import com.example.fooddetection.data.DetectionResult
+import com.example.fooddetection.data.SnappedResult
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -34,6 +35,11 @@ class FoodDetector(
 
     private val _detectionResult = MutableSharedFlow<DetectionResult>(extraBufferCapacity = 1)
     val detectionResult: SharedFlow<DetectionResult> = _detectionResult
+
+    private val _snappedResult = MutableSharedFlow<SnappedResult>(extraBufferCapacity = 1)
+    val snappedResult: SharedFlow<SnappedResult> = _snappedResult
+
+    var isSnapping: Boolean = false
 
     private val detectorScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private val imageChannel = Channel<ImageProxy>(capacity = Channel.CONFLATED) { it.close() }
@@ -111,26 +117,23 @@ class FoodDetector(
         }
 
         try {
+            val bitmap = imageProxy.toBitmap()
+            val rotationDegrees = imageProxy.imageInfo.rotationDegrees
 
-            
+
+
             val inputTensor = currInterpreter.getInputTensor(0)
             val h = inputTensor.shape()[1]
             val w = inputTensor.shape()[2]
 
-            // Convert to Bitmap to ensure RGB format, required by native resizing/cropping.
-            val bitmap = imageProxy.toBitmap()
-            
             val tensorImage = TensorImage(inputTensor.dataType())
             tensorImage.load(bitmap)
 
-            // Correct orientation and aspect ratio distortion
-            val rotation = -imageProxy.imageInfo.rotationDegrees / 90
-            
-            // Post-rotation dimensions
+            val rotation = -rotationDegrees / 90
             val rotatedWidth = if (rotation % 2 != 0) bitmap.height else bitmap.width
             val rotatedHeight = if (rotation % 2 != 0) bitmap.width else bitmap.height
             val cropSize = minOf(rotatedWidth, rotatedHeight)
-            
+
             val processor = ImageProcessor.Builder()
                 .add(Rot90Op(rotation))
                 .add(ResizeWithCropOrPadOp(cropSize, cropSize))
@@ -144,21 +147,30 @@ class FoodDetector(
 
             val processedImage = processor.process(tensorImage)
 
-            // YOLO End2End Output: [1, 300, 6] -> [xmin, ymin, xmax, ymax, score, class]
             val output = Array(1) { Array(300) { FloatArray(6) } }
+
             val startTime = SystemClock.uptimeMillis()
             currInterpreter.run(processedImage.buffer, output)
+
             val inferenceTime = SystemClock.uptimeMillis() - startTime
             val detections = getDetections(output[0])
 
-            _detectionResult.emit(
-                DetectionResult(
-                    detections = detections,
-                    inferenceTime = inferenceTime,
-                    inputImageWidth = w,
-                    inputImageHeight = h,
-                )
+            val result = DetectionResult(
+                detections = detections,
+                inferenceTime = inferenceTime,
+                inputImageWidth = w,
+                inputImageHeight = h,
             )
+
+            // Emit live results
+            _detectionResult.emit(result)
+
+            // Search-for-detection logic: If snapping is active and we found objects, "snap" this frame.
+            if (isSnapping && detections.isNotEmpty()) {
+                isSnapping = false // Stop searching
+                _snappedResult.emit(SnappedResult(tensorImage.bitmap, result))
+            }
+
         } catch (e: Exception) {
             Log.e(TAG, "Detection loop error", e)
         } finally {
@@ -173,7 +185,6 @@ class FoodDetector(
             val score = res[4]
             if (score >= threshold) {
                 val label = labels.getOrElse(res[5].toInt()) { "Unknown" }
-                // Standard YOLO End2End coordinates are normalized 0..1 [xmin, ymin, xmax, ymax]
                 detections.add(Detection(label, RectF(res[0], res[1], res[2], res[3]), score))
             }
         }
