@@ -60,7 +60,7 @@ dependencies {
     // LiteRT
     implementation(libs.litert)
     implementation(libs.litert.support)
-    implementation(libs.litert.metadata)
+
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
