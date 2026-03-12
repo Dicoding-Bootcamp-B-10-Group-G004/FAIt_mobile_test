@@ -1,10 +1,12 @@
-package com.example.fooddetection
+package com.example.fooddetection.ml
 
 import android.content.Context
 import android.graphics.*
 import android.os.SystemClock
 import android.util.Log
 import androidx.camera.core.ImageProxy
+import com.example.fooddetection.data.Detection
+import com.example.fooddetection.data.DetectionResult
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -109,22 +111,43 @@ class FoodDetector(
         }
 
         try {
-            val bitmap = imageProxy.toBitmap()
-            val rotationDegrees = imageProxy.imageInfo.rotationDegrees
-
 
             
             val inputTensor = currInterpreter.getInputTensor(0)
-            val shape = inputTensor.shape() // [1, h, w, 3]
-            val h = shape[1]
-            val w = shape[2]
+            val h = inputTensor.shape()[1]
+            val w = inputTensor.shape()[2]
 
-            val tensorImage = createTensorImage(bitmap, w, h, rotationDegrees, inputTensor.dataType())
+            // Convert to Bitmap to ensure RGB format, required by native resizing/cropping.
+            val bitmap = imageProxy.toBitmap()
+            
+            val tensorImage = TensorImage(inputTensor.dataType())
+            tensorImage.load(bitmap)
+
+            // Correct orientation and aspect ratio distortion
+            val rotation = -imageProxy.imageInfo.rotationDegrees / 90
+            
+            // Post-rotation dimensions
+            val rotatedWidth = if (rotation % 2 != 0) bitmap.height else bitmap.width
+            val rotatedHeight = if (rotation % 2 != 0) bitmap.width else bitmap.height
+            val cropSize = minOf(rotatedWidth, rotatedHeight)
+            
+            val processor = ImageProcessor.Builder()
+                .add(Rot90Op(rotation))
+                .add(ResizeWithCropOrPadOp(cropSize, cropSize))
+                .add(ResizeOp(h, w, ResizeOp.ResizeMethod.BILINEAR))
+                .apply {
+                    if (inputTensor.dataType() == DataType.FLOAT32) {
+                        add(NormalizeOp(0f, 255f))
+                    }
+                }
+                .build()
+
+            val processedImage = processor.process(tensorImage)
 
             // YOLO End2End Output: [1, 300, 6] -> [xmin, ymin, xmax, ymax, score, class]
             val output = Array(1) { Array(300) { FloatArray(6) } }
             val startTime = SystemClock.uptimeMillis()
-            currInterpreter.run(tensorImage.buffer, output)
+            currInterpreter.run(processedImage.buffer, output)
             val inferenceTime = SystemClock.uptimeMillis() - startTime
             val detections = getDetections(output[0])
 
@@ -143,32 +166,6 @@ class FoodDetector(
         }
     }
 
-    private fun createTensorImage(
-        bitmap: Bitmap, w: Int, h: Int, rotationDegrees: Int, dataType: DataType
-    ): TensorImage {
-        val rotation = -rotationDegrees / 90
-
-        // Match aspect ratio by center-cropping to a square before resizing
-        // This prevents the "vertically long" distortion
-        val sensorWidth = if (rotationDegrees % 180 == 0) bitmap.width else bitmap.height
-        val sensorHeight = if (rotationDegrees % 180 == 0) bitmap.height else bitmap.width
-        val cropSize = minOf(sensorWidth, sensorHeight)
-
-        val builder = ImageProcessor.Builder()
-            .add(Rot90Op(rotation))
-            .add(ResizeWithCropOrPadOp(cropSize, cropSize))
-            .add(ResizeOp(h, w, ResizeOp.ResizeMethod.BILINEAR))
-
-        if (dataType == DataType.FLOAT32) {
-            builder.add(NormalizeOp(0f, 255f))
-        }
-
-        val processor = builder.build()
-        val tensorImage = TensorImage(dataType)
-        tensorImage.load(bitmap)
-        return processor.process(tensorImage)
-    }
-
     private fun getDetections(results: Array<FloatArray>): List<Detection> {
         val detections = mutableListOf<Detection>()
         for (i in 0 until minOf(300, results.size)) {
@@ -176,9 +173,8 @@ class FoodDetector(
             val score = res[4]
             if (score >= threshold) {
                 val label = labels.getOrElse(res[5].toInt()) { "Unknown" }
-                // Standard Ultralytics TFLite End2End format: [xmin, ymin, xmax, ymax, score, class]
-                val rect = RectF(res[0], res[1], res[2], res[3])
-                detections.add(Detection(label, rect, score))
+                // Standard YOLO End2End coordinates are normalized 0..1 [xmin, ymin, xmax, ymax]
+                detections.add(Detection(label, RectF(res[0], res[1], res[2], res[3]), score))
             }
         }
         return detections.sortedByDescending { it.score }.take(maxResults)
@@ -196,15 +192,4 @@ class FoodDetector(
         const val TAG = "FoodDetector"
         private val YAML_NAME_REGEX = Regex("^(\\d+):\\s*['\"]?(.*?)['\"]?$")
     }
-
-    data class DetectionResult(
-        val detections: List<Detection>,
-        val inferenceTime: Long,
-        val inputImageHeight: Int,
-        val inputImageWidth: Int,
-    )
-
-    data class Detection(
-        val label: String, val boundingBox: RectF, val score: Float
-    )
 }
