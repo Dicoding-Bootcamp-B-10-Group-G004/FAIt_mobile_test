@@ -1,7 +1,6 @@
 package com.example.fooddetection
 
 import android.Manifest
-import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.*
 import android.os.Bundle
@@ -26,6 +25,8 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
@@ -35,6 +36,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.example.fooddetection.ui.theme.FoodDetectionTheme
+import kotlinx.coroutines.flow.collectLatest
 import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
@@ -52,6 +54,12 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun ObjectDetectionScreen() {
     val context = LocalContext.current
+    
+    // Dynamically fetch models from assets
+    val availableModels = remember {
+        context.assets.list("")?.filter { it.endsWith(".tflite") } ?: emptyList()
+    }
+
     var hasCameraPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(
@@ -61,12 +69,30 @@ fun ObjectDetectionScreen() {
         )
     }
 
-    var selectedModel by remember { mutableStateOf("yolo26n.tflite") }
-    var detections by remember { mutableStateOf<List<DetectionResult>>(emptyList()) }
+    var selectedModelPath by remember { 
+        val defaultModel = "best_float32.tflite"
+        val initialModel = if (availableModels.contains(defaultModel)) defaultModel else availableModels.firstOrNull() ?: defaultModel
+        mutableStateOf(initialModel)
+    }
+    var detections by remember { mutableStateOf<List<FoodDetector.Detection>>(emptyList()) }
     var inferenceTime by remember { mutableLongStateOf(0L) }
     
-    val foodDetector = remember(selectedModel) {
-        FoodDetector(context, selectedModel)
+    val foodDetector = remember(selectedModelPath) {
+        FoodDetector(context, selectedModelPath)
+    }
+
+    // Cleanup detector when switched or disposed
+    DisposableEffect(foodDetector) {
+        onDispose { foodDetector.close() }
+    }
+
+    // Initialize detector and observe results
+    LaunchedEffect(foodDetector) {
+        foodDetector.setup()
+        foodDetector.detectionResult.collectLatest { result ->
+            detections = result.detections
+            inferenceTime = result.inferenceTime
+        }
     }
 
     val launcher = rememberLauncherForActivityResult(
@@ -84,8 +110,9 @@ fun ObjectDetectionScreen() {
         modifier = Modifier.fillMaxSize(),
         bottomBar = {
             ControlPanel(
-                selectedModel = selectedModel,
-                onModelSelected = { selectedModel = it },
+                selectedModelPath = selectedModelPath,
+                availableModels = availableModels,
+                onModelSelected = { selectedModelPath = it },
                 inferenceTime = inferenceTime
             )
         }
@@ -98,10 +125,7 @@ fun ObjectDetectionScreen() {
             if (hasCameraPermission) {
                 CameraWithOverlay(
                     foodDetector = foodDetector,
-                    onDetectionsUpdated = { res, time ->
-                        detections = res
-                        inferenceTime = time
-                    }
+                    detections = detections
                 )
             } else {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -118,12 +142,11 @@ fun ObjectDetectionScreen() {
 @Composable
 fun CameraWithOverlay(
     foodDetector: FoodDetector,
-    onDetectionsUpdated: (List<DetectionResult>, Long) -> Unit
+    detections: List<FoodDetector.Detection>
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
-    var currentDetections by remember { mutableStateOf<List<DetectionResult>>(emptyList()) }
     val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -146,23 +169,11 @@ fun CameraWithOverlay(
 
                     val imageAnalysis = ImageAnalysis.Builder()
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                         .build()
 
                     imageAnalysis.setAnalyzer(analysisExecutor) { imageProxy ->
-                        try {
-                            val bitmap = imageProxy.toBitmap()
-                            val startTime = System.currentTimeMillis()
-                            val results = foodDetector.detect(bitmap)
-                            val endTime = System.currentTimeMillis()
-
-                            currentDetections = results
-                            onDetectionsUpdated(results, endTime - startTime)
-                        } catch (e: Exception) {
-                            Log.e("MainActivity", "Detection error", e)
-                        } finally {
-                            imageProxy.close()
-                        }
+                        // FoodDetector takes ownership and will close imageProxy
+                        foodDetector.detect(imageProxy)
                     }
 
                     val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
@@ -183,18 +194,18 @@ fun CameraWithOverlay(
         )
 
         // Overlay for bounding boxes
-        DetectionOverlay(detections = currentDetections)
+        DetectionOverlay(detections = detections)
     }
 }
 
 @Composable
-fun DetectionOverlay(detections: List<DetectionResult>) {
+fun DetectionOverlay(detections: List<FoodDetector.Detection>) {
     Canvas(modifier = Modifier.fillMaxSize()) {
         val screenWidth = size.width
         val screenHeight = size.height
 
         detections.forEach { detection ->
-            // Assuming FoodDetector returns normalized coordinates (0..1)
+            // Coordinates are normalized 0..1 from the detector
             val left = detection.boundingBox.left * screenWidth
             val top = detection.boundingBox.top * screenHeight
             val right = detection.boundingBox.right * screenWidth
@@ -202,13 +213,13 @@ fun DetectionOverlay(detections: List<DetectionResult>) {
 
             drawRect(
                 color = Color.Red,
-                topLeft = androidx.compose.ui.geometry.Offset(left, top),
-                size = androidx.compose.ui.geometry.Size(right - left, bottom - top),
+                topLeft = Offset(left, top),
+                size = Size(right - left, bottom - top),
                 style = Stroke(width = 4f)
             )
 
             drawContext.canvas.nativeCanvas.drawText(
-                "Class ${detection.classIndex} (${String.format("%.2f", detection.score)})",
+                "${detection.label} (${String.format("%.2f", detection.score)})",
                 left,
                 top - 10f,
                 Paint().apply {
@@ -223,7 +234,8 @@ fun DetectionOverlay(detections: List<DetectionResult>) {
 
 @Composable
 fun ControlPanel(
-    selectedModel: String,
+    selectedModelPath: String,
+    availableModels: List<String>,
     onModelSelected: (String) -> Unit,
     inferenceTime: Long
 ) {
@@ -238,21 +250,31 @@ fun ControlPanel(
     ) {
         Column(
             modifier = Modifier
+                .windowInsetsPadding(WindowInsets.navigationBars) // Added padding for system navigation buttons
                 .padding(16.dp)
                 .animateContentSize()
         ) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { isExpanded = !isExpanded },
+                    .clickable { isExpanded = !isExpanded }
+                    .padding(bottom = 8.dp),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
                     imageVector = if (isExpanded) Icons.Default.KeyboardArrowDown else Icons.Default.KeyboardArrowUp,
                     contentDescription = null,
-                    modifier = Modifier.padding(bottom = 8.dp),
                     tint = MaterialTheme.colorScheme.primary
                 )
+                // Display inference time on the right when minimized
+                if (!isExpanded) {
+                    Text(
+                        text = "${inferenceTime}ms",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.align(Alignment.CenterEnd)
+                    )
+                }
             }
 
             if (isExpanded) {
@@ -276,7 +298,7 @@ fun ControlPanel(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = selectedModel,
+                                text = selectedModelPath,
                                 style = MaterialTheme.typography.titleMedium,
                                 color = MaterialTheme.colorScheme.primary
                             )
@@ -290,25 +312,18 @@ fun ControlPanel(
                             expanded = menuExpanded,
                             onDismissRequest = { menuExpanded = false }
                         ) {
-                            DropdownMenuItem(
-                                text = { Text("yolo26n_float32.tflite") },
-                                onClick = {
-                                    onModelSelected("yolo26n_float32.tflite")
-                                    menuExpanded = false
-                                }
-                            )
-                            DropdownMenuItem(
-                                text = { Text("yolo26n_int8.tflite") },
-                                onClick = {
-                                    onModelSelected("yolo26n_int8.tflite")
-                                    menuExpanded = false
-                                }
-                            )
+                            availableModels.forEach { model ->
+                                DropdownMenuItem(
+                                    text = { Text(model) },
+                                    onClick = {
+                                        onModelSelected(model)
+                                        menuExpanded = false
+                                    }
+                                )
+                            }
                         }
                     }
                 }
-                
-                Spacer(modifier = Modifier.navigationBarsPadding())
             }
         }
     }
