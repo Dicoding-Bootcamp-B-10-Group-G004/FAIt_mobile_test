@@ -3,6 +3,7 @@ package com.example.fooddetection.ui.screens
 import android.Manifest
 import android.content.pm.PackageManager
 import android.util.Log
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.*
@@ -133,8 +134,12 @@ fun ObjectDetectionScreen() {
                             // Snap Button - Triggers high-speed background search
                             FloatingActionButton(
                                 onClick = {
-                                    screenState = ScreenState.Searching
-                                    foodDetector.isSnapping = true
+                                    if (liveDetections.isNotEmpty()) {
+                                        screenState = ScreenState.Searching
+                                        foodDetector.isSnapping = true
+                                    } else {
+                                        Toast.makeText(context, "No detections found to snap", Toast.LENGTH_SHORT).show()
+                                    }
                                 },
                                 modifier = Modifier
                                     .align(Alignment.BottomCenter)
