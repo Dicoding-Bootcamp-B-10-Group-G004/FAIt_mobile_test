@@ -12,6 +12,8 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.support.common.FileUtil
@@ -23,6 +25,8 @@ import org.tensorflow.lite.support.image.ops.ResizeWithCropOrPadOp
 import org.tensorflow.lite.support.image.ops.Rot90Op
 import java.io.BufferedReader
 import java.io.InputStreamReader
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 class FoodDetector(
     private val context: Context,
@@ -32,6 +36,7 @@ class FoodDetector(
 ) {
     private var interpreter: Interpreter? = null
     private var labels: List<String> = emptyList()
+    private val detectorMutex = Mutex()
 
     private val _detectionResult = MutableSharedFlow<DetectionResult>(extraBufferCapacity = 1)
     val detectionResult: SharedFlow<DetectionResult> = _detectionResult
@@ -54,18 +59,20 @@ class FoodDetector(
     }
 
     suspend fun setup() {
-        withContext(Dispatchers.IO) {
-            try {
-                val litertBuffer = FileUtil.loadMappedFile(context, modelPath)
-                val options = Interpreter.Options().apply {
-                    setNumThreads(4)
-                    setUseXNNPACK(true)
+        detectorMutex.withLock {
+            withContext(Dispatchers.IO) {
+                try {
+                    val litertBuffer = FileUtil.loadMappedFile(context, modelPath)
+                    val options = Interpreter.Options().apply {
+                        setNumThreads(4)
+                        setUseXNNPACK(true)
+                    }
+                    interpreter = Interpreter(litertBuffer, options)
+                    labels = loadLabelsFromYaml()
+                    Log.i(TAG, "Successfully initialized model: $modelPath")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Initialization failed: ${e.message}", e)
                 }
-                interpreter = Interpreter(litertBuffer, options)
-                labels = loadLabelsFromYaml()
-                Log.i(TAG, "Successfully initialized model: $modelPath")
-            } catch (e: Exception) {
-                Log.e(TAG, "Initialization failed: ${e.message}", e)
             }
         }
     }
@@ -111,70 +118,97 @@ class FoodDetector(
     }
 
     private suspend fun processImageProxy(imageProxy: ImageProxy) {
-        val currInterpreter = interpreter ?: run {
-            imageProxy.close()
-            return
-        }
-
-        try {
-            val bitmap = imageProxy.toBitmap()
-            val rotationDegrees = imageProxy.imageInfo.rotationDegrees
-
-
-
-            val inputTensor = currInterpreter.getInputTensor(0)
-            val h = inputTensor.shape()[1]
-            val w = inputTensor.shape()[2]
-
-            val tensorImage = TensorImage(inputTensor.dataType())
-            tensorImage.load(bitmap)
-
-            val rotation = -rotationDegrees / 90
-            val rotatedWidth = if (rotation % 2 != 0) bitmap.height else bitmap.width
-            val rotatedHeight = if (rotation % 2 != 0) bitmap.width else bitmap.height
-            val cropSize = minOf(rotatedWidth, rotatedHeight)
-
-            val processor = ImageProcessor.Builder()
-                .add(Rot90Op(rotation))
-                .add(ResizeWithCropOrPadOp(cropSize, cropSize))
-                .add(ResizeOp(h, w, ResizeOp.ResizeMethod.BILINEAR))
-                .apply {
-                    if (inputTensor.dataType() == DataType.FLOAT32) {
-                        add(NormalizeOp(0f, 255f))
-                    }
-                }
-                .build()
-
-            val processedImage = processor.process(tensorImage)
-
-            val output = Array(1) { Array(300) { FloatArray(6) } }
-
-            val startTime = SystemClock.uptimeMillis()
-            currInterpreter.run(processedImage.buffer, output)
-
-            val inferenceTime = SystemClock.uptimeMillis() - startTime
-            val detections = getDetections(output[0])
-
-            val result = DetectionResult(
-                detections = detections,
-                inferenceTime = inferenceTime,
-                inputImageWidth = w,
-                inputImageHeight = h,
-            )
-
-            // Emit live results
-            _detectionResult.emit(result)
-
-            // Search-for-detection logic: If snapping is active and we found objects, "snap" this frame.
-            if (isSnapping && detections.isNotEmpty()) {
-                isSnapping = false // Stop searching
-                _snappedResult.emit(SnappedResult(tensorImage.bitmap, result))
+        detectorMutex.withLock {
+            val currInterpreter = interpreter ?: run {
+                imageProxy.close()
+                return@withLock
             }
 
-        } catch (e: Exception) {
-            Log.e(TAG, "Detection loop error", e)
-        } finally {
-            imageProxy.close()
+            try {
+                val bitmap = imageProxy.toBitmap()
+                val rotationDegrees = imageProxy.imageInfo.rotationDegrees
+
+                val inputTensor = currInterpreter.getInputTensor(0)
+                val h = inputTensor.shape()[1]
+                val w = inputTensor.shape()[2]
+                val inputDataType = inputTensor.dataType()
+
+                // Input processing
+                val tensorImage = TensorImage(inputDataType)
+                tensorImage.load(bitmap)
+
+                val rotation = -rotationDegrees / 90
+                val rotatedWidth = if (rotation % 2 != 0) bitmap.height else bitmap.width
+                val rotatedHeight = if (rotation % 2 != 0) bitmap.width else bitmap.height
+                val cropSize = minOf(rotatedWidth, rotatedHeight)
+
+                val processor = ImageProcessor.Builder()
+                    .add(Rot90Op(rotation))
+                    .add(ResizeWithCropOrPadOp(cropSize, cropSize))
+                    .add(ResizeOp(h, w, ResizeOp.ResizeMethod.BILINEAR))
+                    .apply {
+                        if (inputDataType == DataType.FLOAT32) {
+                            add(NormalizeOp(0f, 255f))
+                        }
+                    }
+                    .build()
+
+                val processedImage = processor.process(tensorImage)
+
+                val outputTensor = currInterpreter.getOutputTensor(0)
+                val outputDataType = outputTensor.dataType()
+
+                var inferenceTime: Long
+
+                val results: Array<FloatArray> = if (outputDataType == DataType.FLOAT32) {
+                    val output = Array(1) { Array(300) { FloatArray(6) } }
+                    val startTime = SystemClock.uptimeMillis()
+                    currInterpreter.run(processedImage.buffer, output)
+                    inferenceTime = SystemClock.uptimeMillis() - startTime
+                    output[0]
+                } else {
+                    val shape = outputTensor.shape()
+                    val outputBuffer = ByteBuffer.allocateDirect(outputTensor.numBytes())
+                    outputBuffer.order(ByteOrder.nativeOrder())
+
+                    val startTime = SystemClock.uptimeMillis()
+                    currInterpreter.run(processedImage.buffer, outputBuffer)
+                    inferenceTime = SystemClock.uptimeMillis() - startTime
+
+                    outputBuffer.rewind()
+                    val q = outputTensor.quantizationParams()
+                    Array(shape[1]) {
+                        FloatArray(shape[2]) {
+                            val rawValue = if (outputDataType == DataType.INT8) outputBuffer.get().toFloat()
+                            else (outputBuffer.get().toInt() and 0xFF).toFloat()
+                            (rawValue - q.zeroPoint) * q.scale
+                        }
+                    }
+                }
+
+                val detections = getDetections(results)
+
+                val result = DetectionResult(
+                    detections = detections,
+                    inferenceTime = inferenceTime,
+                    inputImageWidth = w,
+                    inputImageHeight = h,
+                )
+
+                // Emit live results
+                _detectionResult.emit(result)
+
+                // Search-for-detection logic: If snapping is active and we found objects, "snap" this frame.
+                if (isSnapping && detections.isNotEmpty()) {
+                    isSnapping = false // Stop searching
+                    _snappedResult.emit(SnappedResult(tensorImage.bitmap, result))
+                }
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Detection loop error", e)
+            } finally {
+                imageProxy.close()
+            }
         }
     }
 
@@ -192,9 +226,14 @@ class FoodDetector(
     }
 
     fun close() {
-        detectorScope.cancel()
-        interpreter?.close()
-        imageChannel.close()
+        detectorScope.launch {
+            detectorMutex.withLock {
+                detectorScope.cancel()
+                interpreter?.close()
+                interpreter = null
+                imageChannel.close()
+            }
+        }
     }
 
     companion object {
