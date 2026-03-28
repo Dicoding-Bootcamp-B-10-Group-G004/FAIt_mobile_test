@@ -16,6 +16,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.gpu.GpuDelegate
 import org.tensorflow.lite.support.common.FileUtil
 import org.tensorflow.lite.support.common.ops.NormalizeOp
 import org.tensorflow.lite.support.image.ImageProcessor
@@ -35,6 +36,7 @@ class FoodDetector(
     var maxResults: Int = MAX_RESULTS_DEFAULT,
 ) {
     private var interpreter: Interpreter? = null
+    private var gpuDelegate: GpuDelegate? = null
     private var labels: List<String> = emptyList()
     private val detectorMutex = Mutex()
 
@@ -58,18 +60,62 @@ class FoodDetector(
         }
     }
 
-    suspend fun setup() {
+    suspend fun setup(useGpu: Boolean = false) {
         detectorMutex.withLock {
             withContext(Dispatchers.IO) {
                 try {
                     val litertBuffer = FileUtil.loadMappedFile(context, modelPath)
-                    val options = Interpreter.Options().apply {
-                        setNumThreads(4)
-                        setUseXNNPACK(true)
+                    
+                    // Close existing resources before re-initializing
+                    interpreter?.close()
+                    interpreter = null
+                    gpuDelegate?.close()
+                    gpuDelegate = null
+
+                    // Probe model data type and quantization
+                    val probeOptions = Interpreter.Options()
+                    val probeInterpreter = Interpreter(litertBuffer, probeOptions)
+                    val inputTensor = probeInterpreter.getInputTensor(0)
+                    val inputDataType = inputTensor.dataType()
+                    
+                    // Logic to skip GPU for INT8 models or if requested
+                    val isExplicitInt8 = modelPath.contains("int8", ignoreCase = true)
+                    val isFloat32 = inputDataType == DataType.FLOAT32
+                    
+                    probeInterpreter.close()
+
+                    // Try to initialize with GPU if it's float32, not explicitly INT8, and user requested it
+                    if (useGpu && isFloat32 && !isExplicitInt8) {
+                        try {
+                            val delegate = GpuDelegate()
+                            val options = Interpreter.Options().apply {
+                                setNumThreads(4)
+                                setUseXNNPACK(true)
+                                addDelegate(delegate)
+                            }
+                            // The Interpreter constructor can throw an exception if the delegate application fails
+                            interpreter = Interpreter(litertBuffer, options)
+                            gpuDelegate = delegate
+                            Log.i(TAG, "GPU delegate successfully enabled for model: $modelPath")
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed to apply GPU delegate, falling back to CPU: ${e.message}")
+                            gpuDelegate?.close()
+                            gpuDelegate = null
+                            interpreter = null
+                        }
                     }
-                    interpreter = Interpreter(litertBuffer, options)
+
+                    // Fallback to CPU if GPU failed or was skipped
+                    if (interpreter == null) {
+                        val options = Interpreter.Options().apply {
+                            setNumThreads(4)
+                            setUseXNNPACK(true)
+                        }
+                        interpreter = Interpreter(litertBuffer, options)
+                        Log.i(TAG, "Initialized model on CPU: $modelPath")
+                    }
+
                     labels = loadLabelsFromYaml()
-                    Log.i(TAG, "Successfully initialized model: $modelPath")
                 } catch (e: Exception) {
                     Log.e(TAG, "Initialization failed: ${e.message}", e)
                 }
@@ -133,14 +179,14 @@ class FoodDetector(
                 val w = inputTensor.shape()[2]
                 val inputDataType = inputTensor.dataType()
 
-                // Input processing
-                val tensorImage = TensorImage(inputDataType)
-                tensorImage.load(bitmap)
-
                 val rotation = -rotationDegrees / 90
                 val rotatedWidth = if (rotation % 2 != 0) bitmap.height else bitmap.width
                 val rotatedHeight = if (rotation % 2 != 0) bitmap.width else bitmap.height
                 val cropSize = minOf(rotatedWidth, rotatedHeight)
+
+                // Input processing
+                val tensorImage = TensorImage(inputDataType)
+                tensorImage.load(bitmap)
 
                 val processor = ImageProcessor.Builder()
                     .add(Rot90Op(rotation))
@@ -157,9 +203,9 @@ class FoodDetector(
 
                 val outputTensor = currInterpreter.getOutputTensor(0)
                 val outputDataType = outputTensor.dataType()
-
+                
                 var inferenceTime: Long
-
+                
                 val results: Array<FloatArray> = if (outputDataType == DataType.FLOAT32) {
                     val output = Array(1) { Array(300) { FloatArray(6) } }
                     val startTime = SystemClock.uptimeMillis()
@@ -180,7 +226,7 @@ class FoodDetector(
                     Array(shape[1]) {
                         FloatArray(shape[2]) {
                             val rawValue = if (outputDataType == DataType.INT8) outputBuffer.get().toFloat()
-                            else (outputBuffer.get().toInt() and 0xFF).toFloat()
+                                           else (outputBuffer.get().toInt() and 0xFF).toFloat()
                             (rawValue - q.zeroPoint) * q.scale
                         }
                     }
@@ -195,12 +241,10 @@ class FoodDetector(
                     inputImageHeight = h,
                 )
 
-                // Emit live results
                 _detectionResult.emit(result)
 
-                // Search-for-detection logic: If snapping is active and we found objects, "snap" this frame.
                 if (isSnapping && detections.isNotEmpty()) {
-                    isSnapping = false // Stop searching
+                    isSnapping = false
                     _snappedResult.emit(SnappedResult(tensorImage.bitmap, result))
                 }
 
@@ -231,6 +275,8 @@ class FoodDetector(
                 detectorScope.cancel()
                 interpreter?.close()
                 interpreter = null
+                gpuDelegate?.close()
+                gpuDelegate = null
                 imageChannel.close()
             }
         }
@@ -241,5 +287,14 @@ class FoodDetector(
         const val THRESHOLD_DEFAULT = 0.45F
         const val TAG = "FoodDetector"
         private val YAML_NAME_REGEX = Regex("^(\\d+):\\s*['\"]?(.*?)['\"]?$")
+
+        fun isGpuSupported(context: Context): Boolean {
+            return try {
+                GpuDelegate().close()
+                true
+            } catch (e: Exception) {
+                false
+            }
+        }
     }
 }
