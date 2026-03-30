@@ -35,6 +35,7 @@ androidx-camera-lifecycle = { group = "androidx.camera", name = "camera-lifecycl
 androidx-camera-view = { group = "androidx.camera", name = "camera-view", version.ref = "camera" }
 litert = { group = "com.google.ai.edge.litert", name = "litert", version.ref = "litert" }
 litert-support = { group = "com.google.ai.edge.litert", name = "litert-support", version.ref = "litert" }
+litert-gpu = { group = "com.google.ai.edge.litert", name = "litert-gpu", version.ref = "litert" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

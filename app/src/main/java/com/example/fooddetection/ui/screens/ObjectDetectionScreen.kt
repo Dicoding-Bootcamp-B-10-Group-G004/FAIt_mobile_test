@@ -58,6 +58,13 @@ fun ObjectDetectionScreen() {
         mutableStateOf(initialModel)
     }
 
+    // GPU selection state
+    var useGpu by remember { mutableStateOf(false) }
+    val isGpuSupported = remember { FoodDetector.isGpuSupported(context) }
+    val isModelQuantized = remember(selectedModelPath) {
+        selectedModelPath.contains("int8", ignoreCase = true)
+    }
+
     var screenState by remember { mutableStateOf(ScreenState.Camera) }
     var liveDetections by remember { mutableStateOf<List<Detection>>(emptyList()) }
     var liveInferenceTime by remember { mutableLongStateOf(0L) }
@@ -71,8 +78,8 @@ fun ObjectDetectionScreen() {
         onDispose { foodDetector.close() }
     }
 
-    LaunchedEffect(foodDetector) {
-        foodDetector.setup()
+    LaunchedEffect(foodDetector, useGpu) {
+        foodDetector.setup(useGpu = useGpu)
 
         // Observe real-time results
         launch {
@@ -112,7 +119,11 @@ fun ObjectDetectionScreen() {
                     selectedModelPath = selectedModelPath,
                     availableModels = availableModels,
                     onModelSelected = { selectedModelPath = it },
-                    inferenceTime = liveInferenceTime
+                    inferenceTime = liveInferenceTime,
+                    useGpu = useGpu,
+                    onUseGpuChanged = { useGpu = it },
+                    isGpuSupported = isGpuSupported,
+                    isModelQuantized = isModelQuantized
                 )
             }
         }

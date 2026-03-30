@@ -60,6 +60,7 @@ dependencies {
     // LiteRT
     implementation(libs.litert)
     implementation(libs.litert.support)
+    implementation(libs.litert.gpu)
 
 
     testImplementation(libs.junit)

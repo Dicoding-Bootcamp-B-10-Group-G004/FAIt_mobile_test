@@ -11,6 +11,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.unit.dp
 
 @Composable
@@ -18,10 +19,17 @@ fun ControlPanel(
     selectedModelPath: String,
     availableModels: List<String>,
     onModelSelected: (String) -> Unit,
-    inferenceTime: Long
+    inferenceTime: Long,
+    useGpu: Boolean,
+    onUseGpuChanged: (Boolean) -> Unit,
+    isGpuSupported: Boolean,
+    isModelQuantized: Boolean
 ) {
     var isExpanded by remember { mutableStateOf(true) }
     var menuExpanded by remember { mutableStateOf(false) }
+
+    // GPU is only available if hardware supports it AND the model is not INT8
+    val canEnableGpu = isGpuSupported && !isModelQuantized
 
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -103,6 +111,42 @@ fun ControlPanel(
                             }
                         }
                     }
+                }
+
+                // GPU Toggle Row
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp)
+                        .alpha(if (canEnableGpu) 1f else 0.5f),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text(
+                            text = "Use GPU Acceleration",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        if (!isGpuSupported) {
+                            Text(
+                                text = "Device not compatible",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        } else if (isModelQuantized) {
+                            Text(
+                                text = "Not supported for INT8 models",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+                    }
+                    Switch(
+                        checked = if (canEnableGpu) useGpu else false,
+                        onCheckedChange = { onUseGpuChanged(it) },
+                        enabled = canEnableGpu
+                    )
                 }
             }
         }
